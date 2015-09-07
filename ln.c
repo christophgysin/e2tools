@@ -31,9 +31,19 @@
 /*  Headers */
 #include "e2tools.h"
 #include "ln.h"
+#include "write.h"
 
 /* Macros */
 #define USAGE "Usage: e2ln [-vfs] source destination\n"
+
+/* Local Prototypes */
+
+static long
+create_sym_link(ext2_filsys fs, ext2_ino_t cwd, char *dest,
+                 char *newfile, int ln_flags);
+static long
+create_link(ext2_filsys fs, ext2_ino_t cwd, ext2_ino_t new_file_ino,
+                 char* dest, char *newfile, int ln_flags);
 
 /* Name:    do_ln()
  *
@@ -126,12 +136,6 @@ do_ln(int argc, char *argv[])
       return(1);
     }
 
-  if (symlink)
-    {
-      fputs("Not implemented yet\n", stderr);
-      return(1);
-    }
-
   cur_filesys = argv[optind++];
   if (NULL == (src_dir = strchr(cur_filesys, ':')))
     {
@@ -159,12 +163,15 @@ do_ln(int argc, char *argv[])
       return(-1);
     }
 
-  /* get the inode number for the source file */
-  if ((retval = ext2fs_namei(fs, srcd, srcd, src_name, &source_file)))
+  if (!symlink)
     {
-      fprintf(stderr, "%s: source file %s\n",error_message(retval), src_name);
-      ext2fs_close(fs);
-      return(retval);
+      /* get the inode number for the source file */
+      if ((retval = ext2fs_namei(fs, srcd, srcd, src_name, &source_file)))
+        {
+          fprintf(stderr, "%s: source file %s\n",error_message(retval), src_name);
+          ext2fs_close(fs);
+          return(retval);
+        }
     }
 
   /* get the destination directory */
@@ -182,7 +189,12 @@ do_ln(int argc, char *argv[])
     }
 
   /* now create the link */
-  if ((retval = create_hard_link(fs, destd, source_file, dest_name, force)))
+  if (symlink)
+      retval = create_sym_link(fs, destd, src_name, dest_name, force);
+  else
+      retval = create_hard_link(fs, destd, source_file, dest_name, force);
+
+  if (retval)
     {
       fprintf(stderr, "Error linking %s/%s as %s/%s\n",
               ((src_dir == NULL) ? "." : src_dir), src_name,
@@ -250,6 +262,20 @@ long
 create_hard_link(ext2_filsys fs, ext2_ino_t cwd, ext2_ino_t new_file_ino,
                  char *newfile, int ln_flags)
 {
+    return create_link(fs, cwd, new_file_ino, NULL, newfile, ln_flags);
+}
+
+long
+create_sym_link(ext2_filsys fs, ext2_ino_t cwd, char *dest,
+                 char *newfile, int ln_flags)
+{
+    return create_link(fs, cwd, -1, dest, newfile, ln_flags);
+}
+
+long
+create_link(ext2_filsys fs, ext2_ino_t cwd, ext2_ino_t new_file_ino,
+                 char* dest, char *newfile, int ln_flags)
+{
   ext2_ino_t curr_ino;
   struct ext2_inode inode;
   long retval;
@@ -304,68 +330,75 @@ create_hard_link(ext2_filsys fs, ext2_ino_t cwd, ext2_ino_t new_file_ino,
       return(1);
     }
 
-  /* read the inode associated with the file */
-  if ((retval = read_inode(fs, new_file_ino, &inode)))
-      {
-      fprintf(stderr, "%s\n", error_message(retval));
-      return (retval);
-      }
-
-  /* determine how to link into the directory based on the type of file */
-  switch(inode.i_mode & LINUX_S_IFMT)
+  if (dest != NULL)
     {
-    case LINUX_S_IFREG:
-      dir_flag = EXT2_FT_REG_FILE;
-      break;
-    case LINUX_S_IFLNK:
-      dir_flag = EXT2_FT_SYMLINK;
-      break;
-    case LINUX_S_IFDIR:
-      dir_flag = EXT2_FT_DIR;
-      break;
-    case LINUX_S_IFSOCK:
-      dir_flag = EXT2_FT_SOCK;
-      break;
-    case LINUX_S_IFBLK:
-      dir_flag = EXT2_FT_BLKDEV;
-      break;
-    case LINUX_S_IFCHR:
-      dir_flag = EXT2_FT_CHRDEV;
-      break;
-    case LINUX_S_IFIFO:
-      dir_flag = EXT2_FT_FIFO;
-      break;
-    default:
-      dir_flag = EXT2_FT_UNKNOWN;
-      break;
+        ext2_ino_t inode;
+        retval = put_symlink(fs, cwd, dest, newfile, &inode);
     }
 
-
-  if ((retval = ext2fs_link(fs, cwd, newfile, new_file_ino, dir_flag)))
-    {
-      /* check to see if we ran out of space in the directory */
-      if (retval == EXT2_ET_DIR_NO_SPACE)
-        {
-          /* try resizing the directory and try again */
-          if (0 == (retval = ext2fs_expand_dir(fs, cwd)))
-            retval = ext2fs_link(fs, cwd, newfile, new_file_ino, dir_flag);
-        }
-      if (retval)
-        {
-          fprintf(stderr, "%s\n", error_message(retval));
-          return retval;
-        }
-    }
-
-
-  /* update the inode stat information */
-  if ((ln_flags & E2T_DO_MV) == 0)
-    {
-      inode.i_links_count++;
-      if ((retval = write_inode(fs, new_file_ino, &inode)))
-        {
+  else if (new_file_ino != -1)
+   {
+      /* read the inode associated with the file */
+      if ((retval = read_inode(fs, new_file_ino, &inode)))
+          {
           fprintf(stderr, "%s\n", error_message(retval));
           return (retval);
+          }
+
+      /* determine how to link into the directory based on the type of file */
+      switch(inode.i_mode & LINUX_S_IFMT)
+        {
+        case LINUX_S_IFREG:
+          dir_flag = EXT2_FT_REG_FILE;
+          break;
+        case LINUX_S_IFLNK:
+          dir_flag = EXT2_FT_SYMLINK;
+          break;
+        case LINUX_S_IFDIR:
+          dir_flag = EXT2_FT_DIR;
+          break;
+        case LINUX_S_IFSOCK:
+          dir_flag = EXT2_FT_SOCK;
+          break;
+        case LINUX_S_IFBLK:
+          dir_flag = EXT2_FT_BLKDEV;
+          break;
+        case LINUX_S_IFCHR:
+          dir_flag = EXT2_FT_CHRDEV;
+          break;
+        case LINUX_S_IFIFO:
+          dir_flag = EXT2_FT_FIFO;
+          break;
+        default:
+          dir_flag = EXT2_FT_UNKNOWN;
+          break;
+        }
+
+      if ((retval = ext2fs_link(fs, cwd, newfile, new_file_ino, dir_flag)))
+        {
+          /* check to see if we ran out of space in the directory */
+          if (retval == EXT2_ET_DIR_NO_SPACE)
+            {
+              /* try resizing the directory and try again */
+              if (0 == (retval = ext2fs_expand_dir(fs, cwd)))
+                retval = ext2fs_link(fs, cwd, newfile, new_file_ino, dir_flag);
+            }
+          if (retval)
+            {
+              fprintf(stderr, "%s\n", error_message(retval));
+              return retval;
+            }
+        }
+
+      /* update the inode stat information */
+      if ((ln_flags & E2T_DO_MV) == 0)
+        {
+          inode.i_links_count++;
+          if ((retval = write_inode(fs, new_file_ino, &inode)))
+            {
+              fprintf(stderr, "%s\n", error_message(retval));
+              return (retval);
+            }
         }
     }
 

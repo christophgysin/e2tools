@@ -46,7 +46,13 @@
 /* Local Prototypes */
 
 static long
-store_data(ext2_filsys fs, int fd, ext2_ino_t newfile, off_t *file_size);
+store_data(ext2_filsys fs, int fd, const char *str, ext2_ino_t newfile, off_t *file_size);
+
+static long
+store_data_fd(ext2_filsys fs, int fd, ext2_ino_t newfile, off_t *file_size);
+
+static long
+store_data_string(ext2_filsys fs, const char *str, ext2_ino_t newfile, off_t *file_size);
 
 /* Name:    put_file()
  *
@@ -105,11 +111,25 @@ store_data(ext2_filsys fs, int fd, ext2_ino_t newfile, off_t *file_size);
  * 04/06/04      K.Sheffield        Added a default file stat parameter
  */
 long
+put_symlink(ext2_filsys fs, ext2_ino_t cwd, char *dest, char *outfile,
+         ext2_ino_t *outfile_ino)
+{
+    return put_file_or_symlink(fs, cwd, dest, outfile, outfile_ino, 0, NULL, true);
+}
+
+long
 put_file(ext2_filsys fs, ext2_ino_t cwd, char *infile, char *outfile,
          ext2_ino_t *outfile_ino, int keep, struct stat *def_stat)
 {
-  int fd;
-  struct stat statbuf;
+    return put_file_or_symlink(fs, cwd, infile, outfile, outfile_ino, keep, def_stat, false);
+}
+
+long
+put_file_or_symlink(ext2_filsys fs, ext2_ino_t cwd, char *infile, char *outfile,
+         ext2_ino_t *outfile_ino, int keep, struct stat *def_stat, bool symlink)
+{
+  int fd = -1;
+  struct stat	statbuf;
   ext2_ino_t newfile;
   long  retval;
   struct ext2_inode inode;
@@ -122,44 +142,54 @@ put_file(ext2_filsys fs, ext2_ino_t cwd, char *infile, char *outfile,
       return (-1);
     }
 
-  if (infile == NULL)
+  if (!symlink)
     {
-      fd = fileno(stdin);
-      memset(&statbuf, 0, sizeof(statbuf));
-    }
-  else
-    {
-      if (0 > (fd = open(infile, O_RDONLY)))
+      if (infile == NULL)
         {
-          perror(infile);
-          fprintf(stderr, "Error opening input file: %s\n", infile);
-          return(-1);
-        }
-      if (0 > fstat(fd, &statbuf))
-        {
-          perror(infile);
-          fprintf(stderr, "Error stat()'ing input file: %s\n", infile);
-          close(fd);
-          return(-1);
-        }
-    }
-
-  if (keep == 0 || infile == NULL)
-    {
-      statbuf.st_atime = statbuf.st_ctime = statbuf.st_mtime = time(NULL);
-      umask(cur_umask = umask(0)); /* get the current umask */
-      if (def_stat != NULL)
-        {
-          statbuf.st_mode = S_IFREG |
-            ((def_stat->st_mode == 0) ? (0666 & ~cur_umask):def_stat->st_mode);
-          statbuf.st_uid = def_stat->st_uid;
-          statbuf.st_gid = def_stat->st_gid;
+          fd = fileno(stdin);
+          memset(&statbuf, 0, sizeof(statbuf));
         }
       else
         {
-          statbuf.st_mode = S_IFREG | (0666 & ~cur_umask);
-          statbuf.st_uid = getuid();
-          statbuf.st_gid = getgid();
+          if (0 > (fd = open(infile, O_RDONLY)))
+            {
+              perror(infile);
+              fprintf(stderr, "Error opening input file: %s\n", infile);
+              return(-1);
+            }
+          if (0 > fstat(fd, &statbuf))
+            {
+              perror(infile);
+              fprintf(stderr, "Error stat()'ing input file: %s\n", infile);
+              close(fd);
+              return(-1);
+            }
+        }
+    }
+
+  if (keep == 0 || infile == NULL || symlink)
+    {
+      statbuf.st_atime = statbuf.st_ctime = statbuf.st_mtime = time(NULL);
+      if (symlink)
+        {
+            statbuf.st_mode = S_IFLNK | 0777;
+        }
+      else
+        {
+          umask(cur_umask = umask(0)); /* get the current umask */
+          if (def_stat != NULL)
+            {
+              statbuf.st_mode = S_IFREG |
+                ((def_stat->st_mode == 0) ? (0666 & ~cur_umask):def_stat->st_mode);
+              statbuf.st_uid = def_stat->st_uid;
+              statbuf.st_gid = def_stat->st_gid;
+            }
+          else
+            {
+              statbuf.st_mode = S_IFREG | (0666 & ~cur_umask);
+              statbuf.st_uid = getuid();
+              statbuf.st_gid = getgid();
+            }
         }
     }
 
@@ -199,7 +229,9 @@ put_file(ext2_filsys fs, ext2_ino_t cwd, char *infile, char *outfile,
       return retval;
     }
 
-  if ((retval = ext2fs_link(fs, cwd, outfile, newfile, EXT2_FT_REG_FILE)))
+  ext2_ino_t type = symlink ? EXT2_FT_SYMLINK : EXT2_FT_REG_FILE;
+
+  if ((retval = ext2fs_link(fs, cwd, outfile, newfile, type)))
     {
       /* check to see if we ran out of space in the directory */
       if (retval == EXT2_ET_DIR_NO_SPACE)
@@ -233,18 +265,25 @@ put_file(ext2_filsys fs, ext2_ino_t cwd, char *infile, char *outfile,
       return (retval);
     }
 
-  if (LINUX_S_ISREG(inode.i_mode) &&
-      (retval = store_data(fs, fd, newfile, &statbuf.st_size)))
+  if (LINUX_S_ISREG(inode.i_mode))
     {
-      close(fd);
+      if ((retval = store_data_fd(fs, fd, newfile, &statbuf.st_size)))
+        {
+          close(fd);
 #ifndef DEBUG
-      rm_file(fs, cwd, outfile, newfile);
-
+          rm_file(fs, cwd, outfile, newfile);
 #endif
-      return(retval);
+          return(retval);
+        }
+      close(fd);
     }
-
-  close(fd);
+  else if (LINUX_S_ISLNK(inode.i_mode))
+    {
+      if ((retval = store_data_string(fs, "foo", newfile, &statbuf.st_size)))
+        {
+          return(retval);
+        }
+    }
 
   /* if we were reading from standard input, figure out the size of
    * the file and save it.
@@ -308,7 +347,19 @@ put_file(ext2_filsys fs, ext2_ino_t cwd, char *infile, char *outfile,
  * 06/26/02      K.Sheffield        Added a call to update_progress()
  */
 static long
-store_data(ext2_filsys fs, int fd, ext2_ino_t newfile, off_t *file_size)
+store_data_fd(ext2_filsys fs, int fd, ext2_ino_t newfile, off_t *file_size)
+{
+    return store_data(fs, fd, NULL, newfile, file_size);
+}
+
+static long
+store_data_string(ext2_filsys fs, const char* str, ext2_ino_t newfile, off_t *file_size)
+{
+    return store_data(fs, -1, str, newfile, file_size);
+}
+
+static long
+store_data(ext2_filsys fs, int fd, const char* str, ext2_ino_t newfile, off_t *file_size)
 {
   ext2_file_t outfile;
   long retval;
@@ -326,34 +377,40 @@ store_data(ext2_filsys fs, int fd, ext2_ino_t newfile, off_t *file_size)
       return retval;
     }
 
-  while (0 < (bytes_read = read(fd, buf, sizeof(buf))))
+  if (fd > 0)
     {
-      ptr = buf;
-      while (bytes_read > 0)
+      while (0 < (bytes_read = read(fd, buf, sizeof(buf))))
         {
-          if ((retval = ext2fs_file_write(outfile, ptr, bytes_read,
-                                          &bytes_written)))
+          ptr = buf;
+          while (bytes_read > 0)
             {
-              fprintf(stderr, "%s\n", error_message(retval));
-              ext2fs_file_close(outfile);
-              *file_size = total;
-              return retval;
+              if ((retval = ext2fs_file_write(outfile, ptr, bytes_read,
+                                              &bytes_written)))
+                {
+                  fprintf(stderr, "%s\n", error_message(retval));
+                  ext2fs_file_close(outfile);
+                  *file_size = total;
+                  return retval;
+                }
+              bytes_read -= bytes_written;
+              total += bytes_written;
+              ptr += bytes_written;
             }
-          bytes_read -= bytes_written;
-          total += bytes_written;
-          ptr += bytes_written;
+          update_progress((unsigned long) total);
         }
-      update_progress((unsigned long) total);
-    }
 
-  if (bytes_read < 0)
-    {
-      perror("store_data");
-      retval = errno;
+      if (bytes_read < 0)
+        {
+          perror("store_data");
+          retval = errno;
+        }
+      else
+        retval = 0;
     }
-  else
-    retval = 0;
-
+  else if (str != 0)
+   {
+     retval = ext2fs_file_write(outfile, str, strlen(str), &bytes_written);
+   }
   finish_progress();
 
   ext2fs_file_close(outfile);
